@@ -28,7 +28,7 @@ model_path = './ckpt'
 if not os.path.exists(model_path): os.makedirs(model_path)
 
 batch_size = {
-    "train": 32,
+    "train": 128,
     "test": 1024
 }
 num_workers = 8
@@ -111,32 +111,36 @@ def train(key):
 num_critic_epoch = 1
 
 
-def train_critic(key, critic_params, actor_params):
+def train_critic(key, critic_params, actor):
     key, subkey = random.split(key)
     net = UNet(subkey)
-    critic_params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
+    # actor = lambda t, x: net.apply(actor_params, t, x)
+    # critic_params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
     critic_flat, critic_tree = tree_flatten(critic_params)
 
     # define gradient and value, no need for adjoint system
-    def critic_gv_fn(_critic_params, _actor_params, x_init, key):
+    def critic_gv_fn(_critic_params, x_init, key):
         # define v for the Hutchinson’s Estimator
         key, subkey = random.split(key)
-        v = random.normal(subkey, tuple([100] + list(x_init.shape)))
+        v = random.normal(subkey, tuple([50] + list(x_init.shape)))
         # define the initial states
-        score_init = net.apply(_actor_params, jnp.zeros(x_init.shape[0]) + 1e-3, x_init)
+        score_init = actor(jnp.zeros(x_init.shape[0]), x_init)
         critic_loss_init = jnp.zeros(1)
+        net_loss_init = jnp.zeros(1)
         critic_grad_init = [jnp.zeros_like(_var) for _var in critic_flat]
-        state_init = [x_init, score_init, critic_loss_init, critic_grad_init]
-
+        state_init = [x_init, score_init, critic_loss_init, critic_grad_init, net_loss_init]
+        # critic = lambda t, x: net.apply(_critic_params, t, x)
         def ode_func(states, t):
             x = states[0]
             score = states[1]
             _t = jnp.ones([x.shape[0]]) * t
             diffusion_weight = diffusion_coeff_fn(t)
-            score_pred = net.apply(_actor_params, _t, x)
+            score_pred = actor(_t, x)
+
             dx = -.5 * (diffusion_weight ** 2) * score_pred
 
-            f = lambda x: -.5 * (diffusion_weight ** 2) * net.apply(_actor_params, _t, x)
+            f = lambda x: -.5 * (diffusion_weight ** 2) * actor(_t, x)
+
 
             def divergence_fn(_x, _v):
                 # Hutchinson’s Estimator
@@ -156,32 +160,41 @@ def train_critic(key, critic_params, actor_params):
             dscore_2 = - jvp(f, (x,), (score,))[1]  # f(x), df/dx * v = jvp(f, x, v)
             dscore = dscore_1 + dscore_2
 
+            weight = 5. ** t
+
             def dcritic_loss_fn(_critic_params, _x):
                 critic_pred = net.apply(_critic_params, _t, _x)
-                loss = ((critic_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()
+                loss = ((critic_pred - score) ** 2).sum(axis=(1, 2, 3)).mean() * weight
                 return loss
 
             dc_vg = jax.value_and_grad(dcritic_loss_fn)
 
-            dcritic_loss, dcritic_grad = dc_vg(critic_params, x)
+            dcritic_loss, dcritic_grad = dc_vg(_critic_params, x)
 
             dcritic_loss = dcritic_loss[None]
 
-            dstates = [dx, dscore, dcritic_loss, dcritic_grad]
+            dnet_loss = ((score_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()[None] * weight
+
+            dstates = [dx, dscore, dcritic_loss, dcritic_grad, dnet_loss]
 
             return dstates
 
-        # ode_func = jax.jit(ode_func)
         tspace = np.array((0., 1.))
 
         result = odeint(ode_func, state_init, tspace, atol=tolerance, rtol=tolerance)
 
         _g = tree_unflatten(critic_tree, [_var[1] for _var in result[3]])
-        # print("============")
-        # for _var in _g:
-        #     print(_var.shape)
-        # print("============")
-        return _g, result[2][1]
+        # weight = 10.
+        # def critic_loss_2(_critic_params):
+        #     critic_pred = net.apply(_critic_params, jnp.zeros(x_init.shape[0]), x_init)
+        #     return jnp.mean(jnp.sum((critic_pred - score_init) ** 2, axis=(1, 2, 3))) * weight
+
+        # vg2 = value_and_grad(critic_loss_2)
+        # _, _g2 = vg2(critic_params)
+
+        # return _g, _g2, result[2][1]
+
+        return _g, result[2][1], result[4][1]
 
     # define optimizer
     opt_def = flax.optim.Adam(learning_rate=lr)
@@ -189,36 +202,33 @@ def train_critic(key, critic_params, actor_params):
 
 
     # define train_op
-    def train_op(_critic_params, _actor_params, _opt, x, key):
-        # g, v = critic_gv_fn_jit(x, key)
-        g, v = critic_gv_fn(_critic_params, _actor_params, x, key)
-        # g = _reshape_like(g)
-        # change the shape of g!
-        # critic.vars().subset(is_a=StateVar).assign(svars_t)
-        # opt(lr, g)
-        return v, _opt.apply_gradient(g)
+    def train_op(_opt, x, key):
+        # g, g2, v = critic_gv_fn(_opt.target, _actor_params, x, key)\
+        # return v, _opt.apply_gradient(g).apply_gradient(g2)
+        g, v_critic, v_actor = critic_gv_fn(_opt.target, x, key)
+        return v_critic, _opt.apply_gradient(g), v_actor
 
     train_op = jax.jit(train_op)
 
     # training process
     for epoch in range(num_critic_epoch):
         avg_loss = 0.
-        num_data = 0
+        # num_data = 0
         for step, (data, _) in enumerate(dataloader["train"]):
             key, subkey = random.split(key)
             data = jnp.array(data.numpy())
             data = jnp.transpose(data, axes=(0, 2, 3, 1))
-            _loss, opt = train_op(critic_params, actor_params, opt, data, subkey)
-            avg_loss += _loss[0]
-            num_data += data.shape[0]
-            print("Step %04d  Loss %.5f" % (step, avg_loss / num_data))
-            # if step > 100:
-            #     break
-        avg_loss /= num_data
+            _loss_critic, opt, _loss_actor = train_op(opt, data, subkey)
+            avg_loss += _loss_critic[0]
+            # num_data += data.shape[0]
+            print("Step %04d  Loss %.5f Loss(net) %.5f" % (step, _loss_critic, _loss_actor))
+            if step >= 50:
+                break
+        avg_loss /= step
         print('Epoch %04d  Loss %.5f' % (epoch + 1, avg_loss))
 
     dict_output = serialization.to_state_dict(opt.target)
-    jnp.save(os.path.join(model_path, 'critic.npy'), [dict_output])
+    # jnp.save(os.path.join(model_path, 'critic.npy'), [dict_output])
     # print(type(critic.vars().subset(is_a=TrainVar).tensors()[0]))
     # np.save(os.path.join(model_path, 'critic1.npy'), np.array(critic.vars().tensors()[0]))
     # vars = []
@@ -232,6 +242,86 @@ def train_critic(key, critic_params, actor_params):
     #     objax.io.save_var_collection(os.path.join(model_path, 'critic.npz'), critic.vars())
     # return critic
     return opt.target
+
+def compute_critic_loss(key, net_params):
+    key, subkey = random.split(key)
+    net = UNet(subkey)
+    # critic_params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
+    net_flat, net_tree = tree_flatten(net_params)
+
+    # define gradient and value, no need for adjoint system
+    def critic_v_fn(_net_params, x_init, key):
+        # define v for the Hutchinson’s Estimator
+        key, subkey = random.split(key)
+        v = random.normal(subkey, tuple([50] + list(x_init.shape)))
+        # define the initial states
+        score_init = net.apply(_net_params, jnp.zeros(x_init.shape[0]) + 1e-3, x_init)
+        critic_loss_init = jnp.zeros(1)
+        state_init = [x_init, score_init, critic_loss_init]
+
+        def ode_func(states, t):
+            x = states[0]
+            score = states[1]
+            _t = jnp.ones([x.shape[0]]) * t
+            diffusion_weight = diffusion_coeff_fn(t)
+            score_pred = net.apply(_net_params, _t, x)
+            dx = -.5 * (diffusion_weight ** 2) * score_pred
+
+            f = lambda x: -.5 * (diffusion_weight ** 2) * net.apply(_net_params, _t, x)
+
+
+            def divergence_fn(_x, _v):
+                # Hutchinson’s Estimator
+                # computes the divergence of net at x with random vector v
+                _, u = jvp(f, (_x,), (_v,))
+                # print(u.shape, _x.shape, _v.shape)
+                return jnp.sum(u * _v)
+
+            batch_div_fn = jax.vmap(divergence_fn, in_axes=[None, 0])
+
+            def batch_div(x):
+                return batch_div_fn(x, v).mean(axis=0)
+
+            grad_div_fn = grad(batch_div)
+
+            dscore_1 = - grad_div_fn(x)
+            dscore_2 = - jvp(f, (x,), (score,))[1]  # f(x), df/dx * v = jvp(f, x, v)
+            dscore = dscore_1 + dscore_2
+
+            dcritic_loss = ((score_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()
+
+
+            dcritic_loss = dcritic_loss[None]
+
+            dstates = [dx, dscore, dcritic_loss]
+
+            return dstates
+
+        tspace = np.array((0., 1.))
+
+        result = odeint(ode_func, state_init, tspace, atol=tolerance, rtol=tolerance)
+
+
+        return result[2][1]
+
+
+    critic_v_fn = jax.jit(critic_v_fn)
+
+    # training process
+    for epoch in range(num_critic_epoch):
+        avg_loss = 0.
+        num_data = 0
+        for step, (data, label) in enumerate(dataloader["train"]):
+            key, subkey = random.split(key)
+            print(label)
+            data = jnp.array(data.numpy())
+            data = jnp.transpose(data, axes=(0, 2, 3, 1))
+            _loss = critic_v_fn(net_params, data, subkey)
+            avg_loss += _loss[0]
+            num_data += data.shape[0]
+            print("Step %04d  Loss %.5f" % (step, avg_loss / num_data))
+        avg_loss /= num_data
+        print('Epoch %04d  Loss %.5f' % (epoch + 1, avg_loss))
 
 num_actor_epoch = 10
 def train_actor(key):
@@ -323,38 +413,38 @@ def train_actor(key):
 
 
 
-def test(key, params):
-    _key = random.PRNGKey(3)
-    _key, _subkey = random.split(_key)
-    net = UNet(_subkey)
-    ## Load the pre-trained checkpoint from disk.
-    # opt_def = flax.optim.Adam(learning_rate=lr)
-    # opt = opt_def.create(params)
-
-
-    sample_batch_size = 64  # @param {'type':'integer'}
-    sampler = ode_sampler  # @param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
-
-    ## Generate samples using the specified sampler.
-    key, subkey = random.split(key)
-    samples = sampler(net,
-                      params,
-                      marginal_prob_std_fn,
-                      diffusion_coeff_fn,
-                      subkey,
-                      sample_batch_size,
-                      eps=1e-3)
-
-    ## Sample visualization.
-    print(jnp.max(samples))
-    samples = jax.lax.clamp(0.0, samples, 1.0)
-    samples = np.array(samples)
-    sample_grid = make_grid(torch.from_numpy(samples), nrow=int(np.sqrt(sample_batch_size)))
-
-    plt.figure(figsize=(6, 6))
-    plt.axis('off')
-    plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
-    plt.show()
+# def test(key, params):
+#     _key = random.PRNGKey(3)
+#     _key, _subkey = random.split(_key)
+#     net = UNet(_subkey)
+#     ## Load the pre-trained checkpoint from disk.
+#     # opt_def = flax.optim.Adam(learning_rate=lr)
+#     # opt = opt_def.create(params)
+#
+#
+#     sample_batch_size = 64  # @param {'type':'integer'}
+#     sampler = ode_sampler  # @param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
+#
+#     ## Generate samples using the specified sampler.
+#     key, subkey = random.split(key)
+#     samples = sampler(net,
+#                       params,
+#                       marginal_prob_std_fn,
+#                       diffusion_coeff_fn,
+#                       subkey,
+#                       sample_batch_size,
+#                       eps=1e-3)
+#
+#     ## Sample visualization.
+#     print(jnp.max(samples))
+#     samples = jax.lax.clamp(0.0, samples, 1.0)
+#     samples = np.array(samples)
+#     sample_grid = make_grid(torch.from_numpy(samples), nrow=int(np.sqrt(sample_batch_size)))
+#
+#     plt.figure(figsize=(6, 6))
+#     plt.axis('off')
+#     plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
+#     plt.show()
 
 # def test_objax(key, ckpt_file):
 #     _key = random.PRNGKey(3)
@@ -386,23 +476,47 @@ def test(key, params):
 #     plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
 #     plt.show()
 
-def test2(key, ckpt_file, new_tensor):
-    _key = random.PRNGKey(3)
-    _key, _subkey = random.split(_key)
-    net = UNet(marginal_prob_std_fn, _subkey)
-    objax.io.load_var_collection(ckpt_file, net.vars())
-    ## Load the pre-trained checkpoint from disk.
-    net.vars().subset(is_a=TrainVar).assign(new_tensor)
+# def test2(key, ckpt_file, new_tensor):
+#     _key = random.PRNGKey(3)
+#     _key, _subkey = random.split(_key)
+#     net = UNet(marginal_prob_std_fn, _subkey)
+#     objax.io.load_var_collection(ckpt_file, net.vars())
+#     ## Load the pre-trained checkpoint from disk.
+#     net.vars().subset(is_a=TrainVar).assign(new_tensor)
+#
+#     sample_batch_size = 64  # @param {'type':'integer'}
+#     sampler = ode_sampler  # @param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
+#
+#     ## Generate samples using the specified sampler.
+#     key, subkey = random.split(key)
+#     samples = sampler(net,
+#                       marginal_prob_std_fn,
+#                       diffusion_coeff_fn,
+#                       subkey,
+#                       sample_batch_size,
+#                       eps=1e-3)
+#
+#     ## Sample visualization.
+#     print(jnp.max(samples))
+#     samples = jax.lax.clamp(0.0, samples, 1.0)
+#     samples = np.array(samples)
+#     sample_grid = make_grid(torch.from_numpy(samples), nrow=int(np.sqrt(sample_batch_size)))
+#
+#     plt.figure(figsize=(6, 6))
+#     plt.axis('off')
+#     plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
+#     plt.show()
 
+def test(key, net):
     sample_batch_size = 64  # @param {'type':'integer'}
     sampler = ode_sampler  # @param ['Euler_Maruyama_sampler', 'pc_sampler', 'ode_sampler'] {'type': 'raw'}
-
     ## Generate samples using the specified sampler.
-    key, subkey = random.split(key)
+    # key, subkey = random.split(key)
+
     samples = sampler(net,
                       marginal_prob_std_fn,
                       diffusion_coeff_fn,
-                      subkey,
+                      key,
                       sample_batch_size,
                       eps=1e-3)
 
@@ -416,7 +530,6 @@ def test2(key, ckpt_file, new_tensor):
     plt.axis('off')
     plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
     plt.show()
-
 
 def test_critic(key, critic):
     net = critic
@@ -446,25 +559,36 @@ def test_critic(key, critic):
 
 
 if __name__ == '__main__':
+    for step, (data, _) in enumerate(dataloader["train"]):
+        continue
     key = random.PRNGKey(1)
     # train(key)
     # key = random.PRNGKey(1)
     ckpt_file = os.path.join(model_path, 'scorenet.npy')
     scorenet_params = jnp.load(ckpt_file, allow_pickle=True)[0]
+    # compute_critic_loss(key, scorenet_params)
+    ckpt_file = os.path.join(model_path, 'critic.npy')
     critic_params = jnp.load(ckpt_file, allow_pickle=True)[0]
-    params = train_critic(key, critic_params, scorenet_params)
+    key, subkey = random.split(key)
+    _net = UNet(subkey)
+    actor = lambda t, x: _net.apply(scorenet_params, t, x)
+    critic_params = train_critic(key, critic_params, actor)
     # objax.io.save_var_collection(os.path.join(model_path, 'critic_train.npz'), critic.vars().subset(is_a=TrainVar))
     # objax.io.save_var_collection(os.path.join(model_path, 'critic_state.npz'), critic.vars().subset(is_a=StateVar))
-    # key = random.PRNGKey(2)
+
     # test_critic(key, critic)
     # ckpt_file = os.path.join(model_path, 'scorenet.npy')
     # # ckpt_file = os.path.join(model_path, 'critic.npz')
     # key, subkey = random.split(key)
     # net = UNet(subkey)
-    # key, subkey = random.split(key)
+
     # _params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
     # params = jnp.load(ckpt_file, allow_pickle=True)[0]
     # params = flax.serialization.from_state_dict(jnp.load(ckpt_file), _params)
-
-    test(key, params)
-    # test2(key, ckpt_file, critic.vars().subset(is_a=TrainVar).tensors())
+    # key = random.PRNGKey(2)
+    # key, subkey = random.split(key)
+    # _net = UNet(subkey)
+    critic = lambda t, x: _net.apply(critic_params, t, x)
+    test(key, actor)
+    test(key, critic)
+    # test(key, lambda t, x: _net.apply(scorenet_params, t, x))

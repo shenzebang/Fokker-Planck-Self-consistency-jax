@@ -5,7 +5,7 @@ import jax.random as random
 from flax import serialization
 
 import jax
-from jax import jvp, grad, value_and_grad
+from jax import jvp, grad, value_and_grad, vjp
 from jax.experimental.ode import odeint
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from sampler import ode_sampler
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import os
+import functools
 
 # global configuration
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = ".5"
@@ -108,6 +109,7 @@ def train(key):
     jnp.save(os.path.join(model_path, 'scorenet.npy'), [dict_output])
     # return opt.target
 
+
 num_critic_epoch = 1
 
 
@@ -115,11 +117,12 @@ def train_critic(key, critic_params, actor):
     key, subkey = random.split(key)
     net = UNet(subkey)
     # actor = lambda t, x: net.apply(actor_params, t, x)
-    # critic_params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
+    critic_params = net.init(subkey, jnp.zeros(1), jnp.zeros((1, 28, 28, 1)))
     critic_flat, critic_tree = tree_flatten(critic_params)
+    f = lambda t, x: -.5 * (diffusion_coeff_fn(t) ** 2) * actor(t, x)
 
     # define gradient and value, no need for adjoint system
-    def critic_gv_fn(_critic_params, x_init, key):
+    def critic_gv_fn(params, x_init, key):
         # define v for the Hutchinson’s Estimator
         key, subkey = random.split(key)
         v = random.normal(subkey, tuple([50] + list(x_init.shape)))
@@ -129,51 +132,42 @@ def train_critic(key, critic_params, actor):
         net_loss_init = jnp.zeros(1)
         critic_grad_init = [jnp.zeros_like(_var) for _var in critic_flat]
         state_init = [x_init, score_init, critic_loss_init, critic_grad_init, net_loss_init]
+
         # critic = lambda t, x: net.apply(_critic_params, t, x)
         def ode_func(states, t):
             x = states[0]
             score = states[1]
-            _t = jnp.ones([x.shape[0]]) * t
-            diffusion_weight = diffusion_coeff_fn(t)
-            score_pred = actor(_t, x)
+            f_t = lambda x: f(t, x)
 
-            dx = -.5 * (diffusion_weight ** 2) * score_pred
+            dx = f_t(x)
 
-            f = lambda x: -.5 * (diffusion_weight ** 2) * actor(_t, x)
+            div_f_t = lambda x, v: divergence_fn(f_t, x, v)
 
+            grad_div_fn = grad(div_f_t)
 
-            def divergence_fn(_x, _v):
-                # Hutchinson’s Estimator
-                # computes the divergence of net at x with random vector v
-                _, u = jvp(f, (_x,), (_v,))
-                # print(u.shape, _x.shape, _v.shape)
-                return jnp.sum(u * _v)
-
-            batch_div_fn = jax.vmap(divergence_fn, in_axes=[None, 0])
-
-            def batch_div(x):
-                return batch_div_fn(x, v).mean(axis=0)
-
-            grad_div_fn = grad(batch_div)
-
-            dscore_1 = - grad_div_fn(x)
-            dscore_2 = - jvp(f, (x,), (score,))[1]  # f(x), df/dx * v = jvp(f, x, v)
+            dscore_1 = - grad_div_fn(x, v)
+            # dscore_2 = - jvp(f_t, (x,), (score,))[1]  # f(x), df/dx * v = jvp(f, x, v)
+            _, vjp_fn = vjp(f_t, x)
+            dscore_2 = - vjp_fn(score)[0]
+            # print(len(dscore_2), type(dscore_2[0]))
             dscore = dscore_1 + dscore_2
 
-            weight = 5. ** t
-
+            weight_loss = .0001 ** t
+            weight_reg = 1. ** t
             def dcritic_loss_fn(_critic_params, _x):
-                critic_pred = net.apply(_critic_params, _t, _x)
-                loss = ((critic_pred - score) ** 2).sum(axis=(1, 2, 3)).mean() * weight
-                return loss
+                critic_pred = net.apply(_critic_params, t, _x)
+                loss = ((critic_pred - score) ** 2).sum(axis=(1, 2, 3)).mean() * weight_loss
+                reg = (critic_pred ** 2).sum(axis=(1, 2, 3)).mean() * weight_reg
+                return loss + reg
 
             dc_vg = jax.value_and_grad(dcritic_loss_fn)
 
-            dcritic_loss, dcritic_grad = dc_vg(_critic_params, x)
+            dcritic_loss, dcritic_grad = dc_vg(params, x)
 
             dcritic_loss = dcritic_loss[None]
 
-            dnet_loss = ((score_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()[None] * weight
+            score_pred = actor(t, x)
+            dnet_loss = ((score_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()[None] * weight_loss
 
             dstates = [dx, dscore, dcritic_loss, dcritic_grad, dnet_loss]
 
@@ -200,7 +194,6 @@ def train_critic(key, critic_params, actor):
     opt_def = flax.optim.Adam(learning_rate=lr)
     opt = opt_def.create(critic_params)
 
-
     # define train_op
     def train_op(_opt, x, key):
         # g, g2, v = critic_gv_fn(_opt.target, _actor_params, x, key)\
@@ -222,7 +215,7 @@ def train_critic(key, critic_params, actor):
             avg_loss += _loss_critic[0]
             # num_data += data.shape[0]
             print("Step %04d  Loss %.5f Loss(net) %.5f" % (step, _loss_critic, _loss_actor))
-            if step >= 50:
+            if step >= 100:
                 break
         avg_loss /= step
         print('Epoch %04d  Loss %.5f' % (epoch + 1, avg_loss))
@@ -242,6 +235,7 @@ def train_critic(key, critic_params, actor):
     #     objax.io.save_var_collection(os.path.join(model_path, 'critic.npz'), critic.vars())
     # return critic
     return opt.target
+
 
 def compute_critic_loss(key, net_params):
     key, subkey = random.split(key)
@@ -269,7 +263,6 @@ def compute_critic_loss(key, net_params):
 
             f = lambda x: -.5 * (diffusion_weight ** 2) * net.apply(_net_params, _t, x)
 
-
             def divergence_fn(_x, _v):
                 # Hutchinson’s Estimator
                 # computes the divergence of net at x with random vector v
@@ -290,7 +283,6 @@ def compute_critic_loss(key, net_params):
 
             dcritic_loss = ((score_pred - score) ** 2).sum(axis=(1, 2, 3)).mean()
 
-
             dcritic_loss = dcritic_loss[None]
 
             dstates = [dx, dscore, dcritic_loss]
@@ -301,9 +293,7 @@ def compute_critic_loss(key, net_params):
 
         result = odeint(ode_func, state_init, tspace, atol=tolerance, rtol=tolerance)
 
-
         return result[2][1]
-
 
     critic_v_fn = jax.jit(critic_v_fn)
 
@@ -323,7 +313,10 @@ def compute_critic_loss(key, net_params):
         avg_loss /= num_data
         print('Epoch %04d  Loss %.5f' % (epoch + 1, avg_loss))
 
+
 num_actor_epoch = 10
+
+
 def train_actor(key):
     # initialize the actor model
     key, subkey = random.split(key)
@@ -332,11 +325,13 @@ def train_actor(key):
     # initialize the critic model
     critic = UNet(marginal_prob_std_fn, subkey)
     objax.io.load_var_collection(os.path.join(model_path, 'critic.npz'), critic.vars())
+
     # define the gradient operator using adjoint system
     def g_actor_fn(data):
         # compute x(T) by solve IVP (I) & compute the actor loss
         # ================ Forward ===================
         states_init = [data, jnp.zeros(1)]
+
         def ode_func1(states, t):
             x = states[0]
             _t = jnp.ones([x.shape[0]]) * t
@@ -356,28 +351,33 @@ def train_actor(key):
         a_T = jnp.zeros_like(x_T)
         actor_g = [jnp.zeros_like(_var) for _var in actor.vars().subset(is_a=TrainVar)]
         states_init = [x_T, a_T, actor_g]
+
         def ode_func2(states, t):
             x = states[0]
             a = states[1]
             _t = jnp.ones([x.shape[0]]) * (1. - t)
             dx = actor(_t, x, training=True)
+
             def _f(_x):
                 _actor_x = actor(_t, _x, training=True)
                 _f1 = jnp.dot(_actor_x, a)
                 _critic_x = critic(_t, _x, training=False)
                 _f2 = jnp.mean(jnp.sum((_actor_x + _critic_x) ** 2, axis=(1, 2, 3)))
                 return -(_f1 + _f2)
+
             da_fn = jax.grad(_f)
             da = da_fn(x)
 
             def _g(_x):
-                return jnp.mean(jnp.sum((actor(_t, _x, training=True) + critic(_t, _x, training=False)) ** 2, axis=(1,2,3)))
+                return jnp.mean(
+                    jnp.sum((actor(_t, _x, training=True) + critic(_t, _x, training=False)) ** 2, axis=(1, 2, 3)))
 
             g_theta_1 = objax.Grad(lambda x: jnp.dot(a, actor(_t, x, training=True)), actor.vars())
             g_theta_2 = objax.Grad(_g, actor.vars())
             dg_theta = g_theta_1(x) + g_theta_2(x)
 
             return [-dx, -da, -dg_theta]
+
         # ================ Backward ==================
 
         result = odeint(ode_func2, states_init, tspace, atol=tolerance, rtol=tolerance)
@@ -412,7 +412,140 @@ def train_actor(key):
     return actor
 
 
+def train_nwgf(key, actor_params):
+    key, subkey = random.split(key)
+    net = UNet(subkey)
+    params_flat, params_tree = tree_flatten(actor_params)
 
+    def nwgf_gv(params, data, key):
+        key, subkey = random.split(key)
+        # stochastic vectors used for trace (divergence) estimation
+        v = random.normal(subkey, tuple([50] + list(data.shape)))
+        f = lambda _x, _t, _params: net.apply(_params, _t, _x) * -.5 * (diffusion_coeff_fn(_t) ** 2)
+        # compute x(T) by solve IVP (I) & compute the actor loss
+        # ================ Forward ===================
+        x_0 = data
+        xi_0 = net.apply(params, jnp.zeros(1), x_0)
+        states_0 = [x_0, xi_0]
+        def ode_func1(states, t):
+            x = states[0]
+            xi = states[1]
+            f_t_theta = lambda _x: f(_x, t, params)
+            dx = f_t_theta(x)
+
+            def h_t_theta(in_1, in_2):
+                # in_1 is xi
+                # in_2 is x
+                # in_3 is theta
+                div_f_t_theta = lambda _x: divergence_fn(f_t_theta, _x, v)
+                grad_div_fn = grad(div_f_t_theta)
+                h1 = - grad_div_fn(in_2)
+                h2 = - jvp(f_t_theta, (in_2,), (in_1,))[1]
+                return h1 + h2
+            dxi = h_t_theta(xi, x)
+            return [dx, dxi]
+        tspace = np.array((0., 1.))
+        result = odeint(ode_func1, states_0, tspace, atol=tolerance, rtol=tolerance)
+        x_T = result[0][1]
+        xi_T = result[1][1]
+        # ================ Forward ===================
+
+        # ================ Backward ==================
+        # compute dl/d theta via adjoint method
+        a_T = jnp.zeros_like(x_T)
+        b_T = jnp.zeros_like(x_T)
+        grad_T = [jnp.zeros_like(_var) for _var in params_flat]
+        loss_T = jnp.zeros(1)
+        states_T = [x_T, a_T, b_T, xi_T, loss_T, grad_T]
+
+        def ode_func2(states, t):
+            t = 1. - t
+            x = states[0]
+            a = states[1]
+            b = states[2]
+            xi = states[3]
+
+
+            f_t = lambda _x, _params: f(_x, t, _params)
+            dx = f_t(x, params)
+
+            _, vjp_fx_fn = vjp(lambda _x: f_t(_x, params), x)
+            vjp_fx_a = vjp_fx_fn(a)[0]
+            _, vjp_ftheta_fn = vjp(lambda _params: f_t(x, _params), params)
+            vjp_ftheta_a = vjp_ftheta_fn(a)[0]
+            def h_t(in_1, in_2, in_3):
+                # in_1 is xi
+                # in_2 is x
+                # in_3 is theta
+                f_t_theta = lambda _x: f_t(_x, in_3)
+                div_f_t_theta = lambda _x: divergence_fn(f_t_theta, _x, v)
+                grad_div_fn = grad(div_f_t_theta)
+                h1 = - grad_div_fn(in_2)
+                h2 = - jvp(f_t_theta, (in_2,), (in_1,))[1]
+                return h1 + h2
+            _, vjp_hxi_fn = vjp(lambda _xi: h_t(_xi, x, params), xi)
+            vjp_hxi_b = vjp_hxi_fn(b)[0]
+            _, vjp_hx_fn = vjp(lambda _x: h_t(xi, _x, params), x)
+            vjp_hx_b = vjp_hx_fn(b)[0]
+            _, vjp_htheta_fn = vjp(lambda _params: h_t(xi, x, _params), params)
+            vjp_htheta_b = vjp(b)[0]
+            def g_t(in_1, in_2, in_3):
+                # in_1 is xi
+                # in_2 is x
+                # in_3 is theta
+                return jnp.mean(jnp.sum((f_t(in_2, in_3) - in_1) ** 2, axis=(1, 2, 3)), keepdims=True)
+            dxg = grad(g_t, argnums=1)
+            dthetag = grad(g_t, argnums=2)
+
+            da = - vjp_fx_a - vjp_hx_b - dxg(xi, x, params)
+            db = - vjp_hxi_b - dthetag(xi, x, params)
+            dxi = h_t(xi, x, params)
+            dloss = g_t(xi, x, params)
+
+            dgrad = vjp_ftheta_a + vjp_htheta_b + dthetag(xi, x, params)
+
+            return [-dx, -da, -db, -dxi, dloss, dgrad]
+        # ================ Backward ==================
+        tspace = np.array((1., 0.))
+        result = odeint(ode_func2, states_T, tspace, atol=tolerance, rtol=tolerance)
+
+        grad_T = tree_unflatten(params_tree, [_var[1] for _var in result[5]])
+
+
+        loss_T = result[4][1]
+        return grad_T, loss_T
+
+    opt_def = flax.optim.Adam(learning_rate=lr)
+    opt = opt_def.create(actor_params)
+
+    # define train_op
+    def train_op(_opt, x, key):
+        # g, g2, v = critic_gv_fn(_opt.target, _actor_params, x, key)\
+        # return v, _opt.apply_gradient(g).apply_gradient(g2)
+        g, v = nwgf_gv(_opt.target, x, key)
+        return v, _opt.apply_gradient(g)
+
+    train_op = jax.jit(train_op)
+
+    # training process
+    for epoch in range(num_critic_epoch):
+        avg_loss = 0.
+        # num_data = 0
+        step = 0
+        for _, (data, _) in enumerate(dataloader["train"]):
+            step += 1
+            key, subkey = random.split(key)
+            data = jnp.array(data.numpy())
+            data = jnp.transpose(data, axes=(0, 2, 3, 1))
+            _loss_critic, opt = train_op(opt, data, subkey)
+            avg_loss += _loss_critic[0]
+            print("Step %04d  Loss %.5f" % (step, _loss_critic))
+            if step >= 50:
+                break
+        avg_loss /= step
+        print('Epoch %04d  Loss %.5f' % (epoch + 1, avg_loss))
+
+    return opt.target
 # def test(key, params):
 #     _key = random.PRNGKey(3)
 #     _key, _subkey = random.split(_key)
@@ -531,6 +664,7 @@ def test(key, net):
     plt.imshow(sample_grid.permute(1, 2, 0).cpu(), vmin=0., vmax=1.)
     plt.show()
 
+
 def test_critic(key, critic):
     net = critic
 
@@ -573,6 +707,9 @@ if __name__ == '__main__':
     _net = UNet(subkey)
     actor = lambda t, x: _net.apply(scorenet_params, t, x)
     critic_params = train_critic(key, critic_params, actor)
+    # params = train_nwgf(key, scorenet_params)
+    # actor_nwgf = lambda t, x: _net.apply(params, t, x)
+    # test(key, actor_nwgf)
     # objax.io.save_var_collection(os.path.join(model_path, 'critic_train.npz'), critic.vars().subset(is_a=TrainVar))
     # objax.io.save_var_collection(os.path.join(model_path, 'critic_state.npz'), critic.vars().subset(is_a=StateVar))
 

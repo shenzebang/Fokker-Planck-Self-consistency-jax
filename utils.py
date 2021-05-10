@@ -1,16 +1,19 @@
 import jax.numpy as jnp
 import objax
+import jax
 
 
 def marginal_prob_std(t: float, sigma: float) -> float:
-    return jnp.sqrt((sigma ** (2*t) - 1.)/2./jnp.log(sigma))
+    return jnp.sqrt((sigma ** (2 * t) - 1.) / 2. / jnp.log(sigma))
 
 
 def diffusion_coeff(t: float, sigma: float) -> float:
-    return sigma**t
+    return sigma ** t
+
 
 def flatten(vars: objax.VarCollection):
     return jnp.concatenate([jnp.ravel(param) for param in vars], axis=0)
+
 
 def reshape_like(flat_tensor, shape_list):
     prev_ind = 0
@@ -22,11 +25,22 @@ def reshape_like(flat_tensor, shape_list):
         # print(shape[0])
         # flat_size = int(jnp.prod(shape[0]))
         # flat_size = int(shape)
-        _tensors.append(flat_tensor[prev_ind:prev_ind+flat_size].reshape(shape))
+        _tensors.append(flat_tensor[prev_ind:prev_ind + flat_size].reshape(shape))
         prev_ind += flat_size
 
     return _tensors
 
 
+def _divergence_fn(f, _x, _v):
+    # Hutchinson’s Estimator
+    # computes the divergence of net at x with random vector v
+    _, u = jax.jvp(f, (_x,), (_v,))
+    # print(u.shape, _x.shape, _v.shape)
+    return jnp.sum(u * _v)
 
 
+batch_div_fn = jax.vmap(_divergence_fn, in_axes=[None, None, 0])
+
+
+def divergence_fn(f, _x, _v):
+    return batch_div_fn(f, _x, _v).mean(axis=0)

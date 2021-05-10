@@ -93,6 +93,10 @@ class UNet(nn.Module):
 
     def __call__(self, t, x):
         # Obtain the Gaussian random feature embedding for t
+        if type(t) is float:
+            t = jnp.ones([x.shape[0]]) * t
+        elif t.ndim == 0 or t.shape[0] == 1:
+            t = jnp.ones([x.shape[0]]) * t
         embed = self.act(self.embed_dense(self.embed(t)))
         # print("embed.shape", embed.shape)
         # print("x.shape", x.shape)

@@ -104,11 +104,13 @@ class UNet(objax.Module):
     def __call__(self, t, x, training):
         # Obtain the Gaussian random feature embedding for t
         embed = self.act(self.embed(t))
+        # print(embed.shape)
         # print(x.shape)
         # print(t.shape)
         # assert not torch.isnan(torch.sum(embed))
         # Encoding path
         h1 = self.conv1(x)
+        # print(h1.shape)
         ## Incorporate information from t
         h1 += self.dense1(embed)
         # print("shape", self.dense1(embed).shape)
@@ -152,6 +154,8 @@ class UNet(objax.Module):
         h += self.dense7(embed)
         h = self.tgnorm2(h, training=training)
         h = self.act(h)
+        # print(h.shape)
+
         h = self.tconv1(jnp.concatenate([h, h1], axis=1))
         # print(h.shape)
 

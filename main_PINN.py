@@ -22,7 +22,7 @@ from core import distribution, potential
 # from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 from test_utils import eval_Gaussian_score_FP, test_Gaussian_score
-
+dim = 2
 import functools
 
 
@@ -104,12 +104,13 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
 
     # unpack the test data
     time_stamps, grid_points, gaussian_scores_on_grid = test_data
-    data = test_data[1]
     for step in trange(num_iterations):
         key, subkey = random.split(key)
+        data = jax.random.uniform(subkey, (batch_size, dim), minval=-10, maxval=10)
         # data = init_distribution.sample(batch_size)
-        idx = jax.random.choice(subkey, data.shape[0], (batch_size,))
-        loss, opt = train_op(opt, data[idx])
+        # idx = jax.random.choice(subkey, grid_points.shape[0], (batch_size,))
+
+        loss, opt = train_op(opt, data)
         running_avg_loss += loss[0]
         if step % testing_freq == testing_freq - 1:
             f_x = grad(net.apply, argnums=2)
@@ -146,7 +147,7 @@ if __name__ == '__main__':
     key = random.PRNGKey(1)
     key, subkey = random.split(key)
 
-    dim = 2
+
     mu0 = jnp.zeros((dim,))
     sigma0 = jnp.eye(dim)
     init_distribution = distribution.Gaussian(mu0, sigma0, subkey)

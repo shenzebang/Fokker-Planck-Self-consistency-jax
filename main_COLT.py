@@ -36,7 +36,7 @@ tolerance = 1e-5
 T = 3.
 discount = 1.
 scale = 1.
-reg_f = 1
+reg_f = 0.
 testing_freq = 10
 
 
@@ -198,6 +198,14 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
     # unpack the test data
     time_stamps, grid_points, gaussian_scores_on_grid = test_data
 
+    def test_op(params, time_stamps, grid_points, Gaussian_score):
+        v_net_apply = jax.vmap(net.apply, in_axes=[None, 0, None])
+        negative_scores_pred = v_net_apply(params, time_stamps, grid_points)
+
+        return jnp.mean(jnp.sum((negative_scores_pred + Gaussian_score) ** 2, axis=(2,)))
+
+    test_op = jax.jit(test_op)
+
     for step in trange(num_iterations):
         data = init_distribution.sample(batch_size)
         loss_b, opt, loss_f, error_x, error_xi = train_op(opt, data)
@@ -205,7 +213,7 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
         running_error_xi += error_xi
         running_error_x += error_x
         if step % testing_freq == testing_freq - 1:
-            testing_error = test_Gaussian_score(net, opt.target, time_stamps, grid_points, gaussian_scores_on_grid)
+            testing_error = test_op(opt.target, time_stamps, grid_points, gaussian_scores_on_grid)
 
             print('Step %04d  Loss %.5f Error_xi %.5f Error_x %.5f Test %.5f' %     (step + 1,
                                                             running_avg_loss    /   (step + 1),
@@ -234,7 +242,8 @@ if __name__ == '__main__':
     key, subkey = random.split(key)
     mu_target = jnp.zeros((dim,)) + 4
     # sigma_target = jax.random.normal(subkey, (dim, dim))
-    sigma_target = jnp.eye(dim)
+    # sigma_target = jnp.eye(dim)
+    sigma_target = jnp.diag(jnp.array([1.1, 0.9]))
     target_potential = potential.QuadraticPotential(mu_target, sigma_target)
 
     # construct the NODE

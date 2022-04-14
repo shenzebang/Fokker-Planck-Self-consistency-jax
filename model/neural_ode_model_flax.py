@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import jax
 from flax import linen as nn
+from typing import List
 
 
 class GaussianFourierProjection(nn.Module):
@@ -15,6 +16,7 @@ class GaussianFourierProjection(nn.Module):
             W = jax.random.normal(key, [embed_dim // 2])
             W = W * scale
             return W
+
         kernel = self.param('random_feature', _init, self.embed_dim, self.scale)
         x_proj = x[:, None] * kernel[None, :] * 2 * jnp.pi
         return jnp.concatenate([jnp.sin(x_proj), jnp.cos(x_proj)], axis=-1)
@@ -35,6 +37,7 @@ class UNet(nn.Module):
     key: jnp.ndarray
     channels: jnp.array = jnp.array([32, 64, 128, 256])
     embed_dim: int = 256
+
     def setup(self):
         """Initialize a time-dependent score-based network.
         Args:
@@ -86,7 +89,6 @@ class UNet(nn.Module):
         # self.tgnorm2 = nn.BatchNorm()
         self.tconv1 = nn.ConvTranspose(features=1, kernel_size=(3, 3), strides=(1, 1), padding='SAME',
                                        use_bias=True)
-
 
         # The swish activation function
         self.act = lambda x: x * jax.nn.sigmoid(x)
@@ -162,3 +164,145 @@ class UNet(nn.Module):
         # print(self.marginal_prob_std(t))
         # assert not torch.isnan(torch.sum(h))
         return h
+
+
+class ConcatSquashLinear(nn.Module):
+    dim_out: int = 64
+
+    def setup(self):
+        self._layer = nn.Dense(features=self.dim_out)
+        self._hyper_bias = nn.Dense(features=self.dim_out, use_bias=False)
+        self._hyper_gate = nn.Dense(features=self.dim_out)
+
+    def __call__(self, t, x):
+        if type(t) is float:
+            t = jnp.ones(1) * t
+        elif t.ndim == 0:
+            t = jnp.ones(1) * t
+
+        return self._layer(x) * jax.nn.sigmoid(self._hyper_gate(t)) \
+               + self._hyper_bias(t)
+
+
+class DenseNet(nn.Module):
+    dim: int  # the ambient dimension of the problem
+    hidden_dims = [64, 64, 64]
+
+    def setup(self):
+        self.layers = [ConcatSquashLinear(dim_out) for dim_out in self.hidden_dims + [self.dim]]
+
+        # for dim_out in self.hidden_dims + [self.dim]:
+        #     layer = ConcatSquashLinear(dim_out)
+        #     self.layers.append(layer)
+
+        self.activation = jax.nn.tanh
+
+    def __call__(self, t, x):
+        if type(t) is float:
+            t = jnp.ones(1) * t
+        elif t.ndim == 0:
+            t = jnp.ones(1) * t
+
+        dx = x
+        for i, layer in enumerate(self.layers):
+            dx = layer(t, dx)
+            if i < len(self.layers) - 1:
+                dx = self.activation(dx)
+
+        return dx
+
+class G2GNet(nn.Module):
+    dim: int
+    mu0_offset: float
+    sigma_0: float
+    def setup(self):
+        self.layer = nn.Dense(features=self.dim, use_bias=False)
+        self.layer_sigma = nn.Dense(features=1, use_bias=False)
+
+
+    def __call__(self, t, x):
+        if type(t) is float:
+            t = jnp.ones(1) * t
+        elif t.ndim == 0:
+            t = jnp.ones(1) * t
+        mu_t = self.layer(jnp.ones(1)) * jnp.exp(-t)
+        sigma_t_2 = self.layer_sigma(jnp.ones(1)) * jnp.exp(-t*2) + 1
+        # sigma_t_2 = (self.sigma_0 ** 2 - 1) * jnp.exp(-t * 2) + 1
+        # mu_t = jnp.ones(x.shape[-1]) * self.mu0_offset * jnp.exp(-t)
+        return (x - mu_t)/sigma_t_2
+
+
+
+
+class DenseNet2(nn.Module):
+    dim: int  # the ambient dimension of the problem
+    key: jnp.ndarray
+    hidden_dims = [64, 64, 64]
+    # hidden_dims = [64, 64, 64]
+    embed_dim: int = 64
+
+
+    def setup(self):
+        self.embed = GaussianFourierProjection(embed_dim=self.embed_dim, key=self.key)
+        self.embed_dense = nn.Dense(features=self.embed_dim)
+        self.layers = [nn.Dense(dim_out) for dim_out in self.hidden_dims + [self.dim]]
+        self.embed_denses = [nn.Dense(dim_out) for dim_out in self.hidden_dims + [self.dim]]
+        # for dim_out in self.hidden_dims + [self.dim]:
+        #     layer = ConcatSquashLinear(dim_out)
+        #     self.layers.append(layer)
+        self.act = lambda x: x * jax.nn.sigmoid(x)
+
+
+    def __call__(self, t, x):
+
+
+        if type(t) is float:
+            t = jnp.ones(1) * t
+        elif t.ndim == 0:
+            t = jnp.ones(1) * t
+
+        embed = jnp.squeeze(self.act(self.embed_dense(self.embed(t))))
+
+        dx = x
+        for i, (layer, embed_dense) in enumerate(zip(self.layers, self.embed_denses)):
+            dx = layer(dx) + embed_dense(embed)
+            if i < len(self.layers) - 1:
+                dx = self.act(dx)
+
+        return dx
+
+class DenseNet3(nn.Module):
+    dim: int  # the ambient dimension of the problem
+    key: jnp.ndarray
+    hidden_dims = [64, 64, 64]
+    embed_dim: int = 64
+
+
+    def setup(self):
+        self.embed = GaussianFourierProjection(embed_dim=self.embed_dim, key=self.key)
+        self.embed_dense = nn.Dense(features=self.embed_dim)
+        self.layers = [nn.Dense(dim_out) for dim_out in self.hidden_dims + [self.dim]]
+        self.embed_denses = [nn.Dense(dim_out) for dim_out in self.hidden_dims + [self.dim]]
+        # for dim_out in self.hidden_dims + [self.dim]:
+        #     layer = ConcatSquashLinear(dim_out)
+        #     self.layers.append(layer)
+        self.act = lambda x: x * jax.nn.sigmoid(x)
+
+
+    def __call__(self, t, x):
+
+
+        if type(t) is float:
+            t = jnp.ones(1) * t
+        elif t.ndim == 0:
+            t = jnp.ones(1) * t
+
+        embed = jnp.squeeze(self.act(self.embed_dense(self.embed(t))))
+
+        dx = x
+        for i, (layer, embed_dense) in enumerate(zip(self.layers, self.embed_denses)):
+            dx = layer(dx) + embed_dense(embed)
+            if i < len(self.layers) - 1:
+                dx = self.act(dx)
+
+        return jnp.squeeze(dx)

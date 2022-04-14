@@ -1,7 +1,8 @@
 import jax.numpy as jnp
-import objax
+# import objax
 import jax
 
+v_matmul = jax.vmap(jnp.matmul, in_axes=(None, 0))
 
 def marginal_prob_std(t: float, sigma: float) -> float:
     return jnp.sqrt((sigma ** (2 * t) - 1.) / 2. / jnp.log(sigma))
@@ -11,8 +12,8 @@ def diffusion_coeff(t: float, sigma: float) -> float:
     return sigma ** t
 
 
-def flatten(vars: objax.VarCollection):
-    return jnp.concatenate([jnp.ravel(param) for param in vars], axis=0)
+# def flatten(vars: objax.VarCollection):
+#     return jnp.concatenate([jnp.ravel(param) for param in vars], axis=0)
 
 
 def reshape_like(flat_tensor, shape_list):
@@ -39,8 +40,26 @@ def _divergence_fn(f, _x, _v):
     return jnp.sum(u * _v)
 
 
+# f_list = [lambda x: f(x)[i]]
+
+def _divergence_bf_fn(f, _x):
+    # brute-force implementation of the divergence operator
+    # _x should be a d-dimensional vector
+    jacobian = jax.jacfwd(f)
+    a = jacobian(_x)
+    return jnp.sum(jnp.diag(a))
+
+
+
+batch_div_bf_fn = jax.vmap(_divergence_bf_fn, in_axes=[None, 0])
+
 batch_div_fn = jax.vmap(_divergence_fn, in_axes=[None, None, 0])
 
 
-def divergence_fn(f, _x, _v):
-    return batch_div_fn(f, _x, _v).mean(axis=0)
+def divergence_fn(f, _x, _v=None):
+    if _v is None:
+        return batch_div_bf_fn(f, _x)
+    else:
+        return batch_div_fn(f, _x, _v).mean(axis=0)
+
+

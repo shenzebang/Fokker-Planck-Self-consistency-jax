@@ -21,7 +21,9 @@ from core import distribution, potential
 # from sampler import ode_sampler
 # from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
-from test_utils import eval_Gaussian_score_FP, test_Gaussian_score
+from test_utils import eval_Gaussian_score_and_log_density_FP
+import pandas as pd
+from main_COLT import domain_size, mu_shift, T
 dim = 2
 import functools
 
@@ -32,12 +34,8 @@ num_iterations = 5000
 batch_size = 64
 lr = 1e-2
 tolerance = 1e-5
-T = 3.
-discount = 1.
-scale = 1.
-reg_f = 1
-testing_freq = 10
-
+testing_freq = 100
+save_freq = 1000
 # we use f (net with params) to parameterize log alpha
 
 
@@ -102,8 +100,17 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
     # training process
     running_avg_loss = 0.
 
+    score_testing_error_list = []
+    log_density_testing_error_list = []
+    step_list = []
+    loss_list = []
+    save_dir = f"./save/COLT"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    save_file = f"./save/COLT/PINN.csv"
+
     # unpack the test data
-    time_stamps, grid_points, gaussian_scores_on_grid = test_data
+    time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid = test_data
     for step in trange(num_iterations):
         key, subkey = random.split(key)
         data = jax.random.uniform(subkey, (batch_size, dim), minval=-10, maxval=10)
@@ -117,10 +124,15 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
             v_f_x = jax.vmap(f_x, in_axes=[None, None, 0])
             vv_f_x = jax.vmap(v_f_x, in_axes=[None, 0, None])
             scores_pred = vv_f_x(opt.target, time_stamps, grid_points)
-            testing_error = jnp.mean(jnp.sum((scores_pred - gaussian_scores_on_grid) ** 2, axis=(2,)))
+            score_testing_error = jnp.mean(jnp.sum((scores_pred - gaussian_scores_on_grid) ** 2, axis=(2,)))
 
+            v_f = jax.vmap(net.apply, in_axes=[None, 0, None])
+            log_density_pred = v_f(opt.target, time_stamps, grid_points)
+            # log_density_testing_error = jnp.mean((log_density_pred - gaussian_log_density_on_grid) ** 2)
 
-
+            log_density_testing_error = jnp.mean(
+                jnp.sum(jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:])),
+                        axis=1))  # ignore time 0
 
             # testing_error = []
             # for i, t in enumerate(time_stamps):
@@ -130,11 +142,33 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
             #     print(t)
             # testing_error = jnp.mean(jnp.array(testing_error))
 
-            print('Step %04d  Loss %.5f  Test %.5f' %     (step + 1,
+            print('Step %04d  Loss %.5f  Score Error %.5f Log-density Error %.5f' %     (step + 1,
                                                             running_avg_loss    /   (step + 1),
-                                                            testing_error
+                                                            score_testing_error,
+                                                            log_density_testing_error
                                                             )
                   )
+            step_list.append(step + 1)
+            score_testing_error_list.append(score_testing_error)
+            log_density_testing_error_list.append(log_density_testing_error)
+            loss_list.append(running_avg_loss/(step + 1))
+
+        if step % save_freq == save_freq - 1:
+            steps = jnp.array(step_list)
+            score_accs = jnp.array(score_testing_error_list)
+            log_density_accs = jnp.array(log_density_testing_error_list)
+            losses = jnp.array(loss_list)
+            result = pd.DataFrame(jnp.stack([steps, score_accs, losses, log_density_accs], axis=1),
+                                  columns=['steps', 'score_accs', 'losses', 'log-density accs'])
+            result.to_csv(save_file, index=False)
+
+    steps = jnp.array(step_list)
+    score_accs = jnp.array(score_testing_error_list)
+    log_density_accs = jnp.array(log_density_testing_error_list)
+    losses = jnp.array(loss_list)
+    result = pd.DataFrame(jnp.stack([steps, score_accs, losses, log_density_accs], axis=1),
+                          columns=['steps', 'score_accs', 'losses', 'log-density accs'])
+    result.to_csv(save_file, index=False)
 
     return opt.target
 
@@ -148,14 +182,16 @@ if __name__ == '__main__':
     key, subkey = random.split(key)
 
 
-    mu0 = jnp.zeros((dim,))
-    sigma0 = jnp.eye(dim)
+    mu0 = jnp.zeros((dim,)) - mu_shift
+    # sigma0 = jnp.eye(dim)
+    sigma0 = jnp.diag(jnp.array([0.7, 1.3]))
     init_distribution = distribution.Gaussian(mu0, sigma0, subkey)
 
     key, subkey = random.split(key)
-    mu_target = jnp.zeros((dim,)) + 4
+    mu_target = jnp.zeros((dim,)) + mu_shift
     # sigma_target = jax.random.normal(subkey, (dim, dim))
-    sigma_target = jnp.eye(dim)
+    # sigma_target = jnp.eye(dim)
+    sigma_target = jnp.diag(jnp.array([1.1, 0.9]))
     target_potential = potential.QuadraticPotential(mu_target, sigma_target)
 
     # construct the NODE
@@ -163,12 +199,13 @@ if __name__ == '__main__':
     net = DenseNet3(1, subkey)
 
     # compute the testing data
-    test_time_stamps = jnp.linspace(0, T, num=101)
-    x, y = jnp.linspace(-10, 10, num=101), jnp.linspace(-10, 10, num=101)
+    test_time_stamps = jnp.linspace(0, T, num=11)
+    x, y = jnp.linspace(-domain_size, domain_size, num=201), jnp.linspace(-domain_size, domain_size, num=201)
     xx, yy = jnp.meshgrid(x, y)
     grid_points = jnp.stack([jnp.reshape(xx, (-1)), jnp.reshape(yy, (-1))], axis=1)
-    gaussian_scores_on_grid = eval_Gaussian_score_FP(sigma0, mu0, sigma_target, mu_target, test_time_stamps, grid_points, 1)
-    test_data = [test_time_stamps, grid_points, gaussian_scores_on_grid]
+    gaussian_scores_on_grid, gaussian_log_density_on_grid \
+        = eval_Gaussian_score_and_log_density_FP(sigma0, mu0, sigma_target, mu_target, test_time_stamps, grid_points, 1)
+    test_data = [test_time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid]
     params = train_PINN(net, init_distribution, target_potential, test_data, key)
 
     # plot_result(net, params, init_distribution, target_potential, T)

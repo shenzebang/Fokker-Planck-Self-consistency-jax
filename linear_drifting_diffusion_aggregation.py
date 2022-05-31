@@ -1,6 +1,3 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-
 import flax.optim
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten, tree_unflatten
@@ -12,39 +9,43 @@ from jax import jvp, grad, value_and_grad, vjp
 from jax.experimental.ode import odeint
 
 from utils import *
+from plot_utils import *
 from model.neural_ode_model_flax import UNet, DenseNet, G2GNet, DenseNet2
-from core import distribution, potential
+from core import distribution, potential, interaction
+import torchvision.transforms as transforms
+from torchvision.utils import make_grid
+import matplotlib.pyplot as plt
+from torchvision.datasets import MNIST
+from sampler import ode_sampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
-from test_utils import eval_Gaussian_score_and_log_density_FP, log_density
-import pandas as pd
-
-
+import os
 import functools
 
 
 # global configuration
 
 num_iterations = 5000
-batch_size = 64
-lr = 2e-3
-tolerance = 1e-5
-T = 3.
-reg_f = 0.
-testing_freq = 100
-save_freq = 1000
-domain_size = 10.
-mu_shift = 4.
+batch_size = 1024
+lr = 1e-2
+tolerance = 1e-7
+T = 2.
+discount = 1.
+scale = 1.
+reg_f = 0
 
-def train_nwgf(net, init_distribution: distribution.Distribution, target_potential: potential.Potential, test_data):
 
-    # randomly initialize the model, autobatching is included here
+def train_nwgf(net, init_distribution: distribution.Distribution, target_potential: potential.Potential,
+               interaction_kernel):
+
+    # randomly initialize the model
     params = net.init(subkey, jnp.zeros(1), init_distribution.sample(1))
 
     params_flat, params_tree = tree_flatten(params)
 
     def nwgf_gv(params, data):
-        bar_f = lambda _x, _t, _params: net.apply(_params, _t, _x) - target_potential.gradient(_x)
-        f = lambda _x, _t, _params: net.apply(_params, _t, _x)
+        bar_f = lambda _x, _t, _params: net.apply(_params, _t, _x) * scale - target_potential.gradient(_x)
+        f = lambda _x, _t, _params: net.apply(_params, _t, _x) * scale
         # compute x(T) by solve IVP (I) & compute the actor loss
         # ================ Forward ===================
         x_0 = data
@@ -62,6 +63,7 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
             def h_t_theta(in_1, in_2):
                 # in_1 is xi
                 # in_2 is x
+                # in_3 is theta
                 div_bar_f_t_theta = lambda _x: divergence_fn(bar_f_t_theta, _x).sum(axis=0)
                 grad_div_fn = grad(div_bar_f_t_theta)
                 h1 = - grad_div_fn(in_2)
@@ -75,7 +77,10 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
                 # in_1 is xi
                 # in_2 is x
                 f_t_theta_in_2 = f_t_theta(in_2)
-                return jnp.mean(jnp.sum((f_t_theta_in_2 + in_1) ** 2, axis=(1, )) + reg_f*jnp.sum(f_t_theta_in_2 ** 2, axis=(1,)))
+                reg = reg_f*jnp.sum(f_t_theta_in_2 ** 2, axis=(1,))
+                return jnp.mean(
+                    jnp.sum((f_t_theta_in_2 + in_1 + interaction_kernel.conv_grad(in_2)) ** 2, axis=(1, )) + reg
+                ) * (discount ** t)
 
             dloss = g_t(xi, x)
 
@@ -136,7 +141,10 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
                 # in_2 is x
                 # in_3 is theta
                 f_t_in_2_in_3 = f_t(in_2, in_3)
-                return jnp.mean(jnp.sum((f_t_in_2_in_3 + in_1) ** 2, axis=(1, )) + reg_f*jnp.sum(f_t_in_2_in_3 ** 2, axis=(1, )))
+                reg = reg_f*jnp.sum(f_t_in_2_in_3 ** 2, axis=(1, ))
+                return jnp.mean(
+                    jnp.sum((f_t_in_2_in_3 + in_1 + interaction_kernel.conv_grad(in_2)) ** 2, axis=(1, )) + reg
+                ) * (discount ** t)
 
             dxig = grad(g_t, argnums=0)
             dxg = grad(g_t, argnums=1)
@@ -151,7 +159,7 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
             vjp_htheta_b_flat, _ = tree_flatten(vjp_htheta_b)
             dthetag_flat, _ = tree_flatten(dthetag(xi, x, params))
             # print(len(vjp_ftheta_a_flat), len(vjp_htheta_b_flat), len(dthetag_flat))
-            dgrad = [_dgrad1/x.shape[0] + _dgrad2/x.shape[0] + _dgrad3 for _dgrad1, _dgrad2, _dgrad3 in
+            dgrad = [_dgrad1 + _dgrad2 + _dgrad3 for _dgrad1, _dgrad2, _dgrad3 in
                      zip(vjp_ftheta_a_flat, vjp_htheta_b_flat, dthetag_flat)]
             # dgrad = vjp_ftheta_a + vjp_htheta_b + dthetag(xi, x, params)
 
@@ -187,77 +195,25 @@ def train_nwgf(net, init_distribution: distribution.Distribution, target_potenti
     running_avg_loss = 0.
     running_error_xi = 0.
     running_error_x = 0.
-
-    # unpack the test data
-    time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid = test_data
-
-    def test_op(params, Gaussian_score, gaussian_log_density_on_grid):
-
-        v_net_apply = jax.vmap(net.apply, in_axes=[None, 0, None])
-        negative_scores_pred = v_net_apply(params, time_stamps, grid_points)
-
-        velocity = lambda  _params, _x, _t,: net.apply(_params, _t, _x) - target_potential.gradient(_x)
-
-        v_log_density = jax.vmap(init_distribution.logdensity)
-
-        log_density_pred = log_density(params, velocity, v_log_density, time_stamps, grid_points)
-
-
-        score_error = jnp.mean(jnp.sum((negative_scores_pred + Gaussian_score) ** 2, axis=(2,)))
-        log_density_error = jnp.mean(jnp.sum(jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:])), axis=1))# ignore time 0
-        return score_error, log_density_error
-
-    # test_op = jax.jit(test_op)
-
-
-    score_testing_error_list = []
-    log_density_testing_error_list = []
-    loss_list = []
-    step_list = []
-    save_dir = f"./save/COLT"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    save_file = f"./save/COLT/NWGF.csv"
     for step in trange(num_iterations):
         data = init_distribution.sample(batch_size)
         loss_b, opt, loss_f, error_x, error_xi = train_op(opt, data)
         running_avg_loss += loss_b[0]
         running_error_xi += error_xi
         running_error_x += error_x
-        if step % testing_freq == testing_freq - 1:
-            score_testing_error, log_density_testing_error \
-                = test_op(opt.target, gaussian_scores_on_grid, gaussian_log_density_on_grid)
+        if step % 50 == 0:
+            if init_distribution.dim == 2:
+                bar_f = lambda _x, _t: net.apply(opt.target, _t, _x) - target_potential.gradient(_x)
+                plt_density_2d(init_distribution.logdensity, bar_f)
+            else:
+                plot_result(net, opt.target, init_distribution, target_potential, T)
 
-            print('Step %04d  Loss %.5f Error_xi %.5f Error_x %.5f Score Error %.5f Log-density Error %.5f' %     (step + 1,
-                                                            running_avg_loss    /   (step + 1),
-                                                            running_error_xi    /   (step + 1),
-                                                            running_error_x     /   (step + 1),
-                                                            score_testing_error,
-                                                            log_density_testing_error
-                                                            )
+            print('Step %04d  Loss %.5f Error_xi %.5f Error_x %.5f' % (step + 1,
+                                                          running_avg_loss / (step + 1),
+                                                          running_error_xi / (step + 1),
+                                                          running_error_x / (step + 1)
+                                                                       )
                   )
-            step_list.append(step+1)
-            score_testing_error_list.append(score_testing_error)
-            log_density_testing_error_list.append(log_density_testing_error)
-            loss_list.append(running_avg_loss/(step + 1))
-
-        if step % save_freq == save_freq - 1:
-            steps = jnp.array(step_list)
-            score_accs = jnp.array(score_testing_error_list)
-            log_density_accs = jnp.array(log_density_testing_error_list)
-            losses = jnp.array(loss_list)
-            result = pd.DataFrame(jnp.stack([steps, score_accs, losses, log_density_accs], axis=1),
-                                columns=['steps', 'score_accs', 'losses', 'log-density accs'])
-            result.to_csv(save_file, index=False)
-
-    steps = jnp.array(step_list)
-    score_accs = jnp.array(score_testing_error_list)
-    log_density_accs = jnp.array(log_density_testing_error_list)
-    losses = jnp.array(loss_list)
-    result = pd.DataFrame(jnp.stack([steps, score_accs, losses, log_density_accs], axis=1),
-                          columns=['steps', 'score_accs', 'losses', 'log-density accs'])
-    result.to_csv(save_file, index=False)
 
     return opt.target
 
@@ -271,29 +227,40 @@ if __name__ == '__main__':
     key, subkey = random.split(key)
 
     dim = 2
-    mu0 = jnp.zeros((dim,)) - mu_shift
-    # sigma0 = jnp.eye(dim)
-    sigma0 = jnp.diag(jnp.array([0.7, 1.3]))
-    init_distribution = distribution.Gaussian(mu0, sigma0, subkey)
+    mu0 = 3.
+    sigma0 = 1.
+    if dim == 2:
+        mu_init = jnp.zeros((dim, )) + mu0
+    elif dim == 3:
+        mu_init = jnp.array([0., 0., 4.])
+    sigma_init = jnp.ones((1, )) * sigma0
 
+    mu_target = jnp.zeros((dim,))
+    sigma_target = jnp.ones((1,))
+
+
+    init_distribution = distribution.Gaussian(mu_init, sigma_init, subkey)
+
+    # target_potential = potential.GaussianPotential(mu_target, sigma_target)
+
+
+    # mus_target = jnp.array([[1., 0.], [-1., 0.]]) * 3.
+    if dim == 2:
+        mus_target = jnp.array([[1., 0.], [-1., 0.], [0., 1.], [0., -1.]]) * 4.
+    elif dim == 3:
+        mus_target = jnp.array([[1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.]]) * 4.
+
+    # target_potential = potential.GMMPotential(mus_target, sigma_target)
+    target_potential = potential.VoidPotential()
+
+    # interaction_kernel = interaction.LogRepulsion_QuadAttraction()
+    interaction_kernel = interaction.NavierStokesKernel2D()
     key, subkey = random.split(key)
-    mu_target = jnp.zeros((dim,)) + mu_shift
-    # sigma_target = jax.random.normal(subkey, (dim, dim))
-    # sigma_target = jnp.eye(dim)
-    sigma_target = jnp.diag(jnp.array([1.1, 0.9]))
-    target_potential = potential.QuadraticPotential(mu_target, sigma_target)
+    # net = DenseNet(dim=init_distribution.dim)
+    net = DenseNet2(dim=init_distribution.dim, key=subkey)
+    # net = G2GNet(init_distribution.dim, mu0, sigma0)
 
-    # construct the NODE
-    net = DenseNet2(init_distribution.dim, key)
 
-    # compute the testing data
-    test_time_stamps = jnp.linspace(0, T, num=11)
-    x, y = jnp.linspace(-domain_size, domain_size, num=201), jnp.linspace(-domain_size, domain_size, num=201)
-    xx, yy = jnp.meshgrid(x, y)
-    grid_points = jnp.stack([jnp.reshape(xx, (-1)), jnp.reshape(yy, (-1))], axis=1)
-    gaussian_scores_on_grid, gaussian_log_density_on_grid \
-        = eval_Gaussian_score_and_log_density_FP(sigma0, mu0, sigma_target, mu_target, test_time_stamps, grid_points, 1)
-    test_data = [test_time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid]
-    params = train_nwgf(net, init_distribution, target_potential, test_data)
+    params = train_nwgf(net, init_distribution, target_potential, interaction_kernel)
 
     # plot_result(net, params, init_distribution, target_potential, T)

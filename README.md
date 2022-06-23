@@ -23,6 +23,3 @@ $\Sigma_\infty = \mathrm{diag}(1.1, 0.9)$.
 
 To replicate the results presented in our submission, please use the `*.sh` files under the `script` folder.
 
-## dependence
-
-

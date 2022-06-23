@@ -21,5 +21,5 @@ and $\mu_\infty = (4, 4)$,
 $\Sigma_\infty = \mathrm{diag}(1.1, 0.9)$.
 ## Usage
 
-To replicate the results presented in our submission, please use the `*.sh` files under the `script` folder.
+To replicate the results presented in our submission, please use `run_2D_Fokker_Planck.sh` under the `script` folder.
 

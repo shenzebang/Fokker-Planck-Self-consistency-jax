@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 from core.distribution import Distribution
-from linear_drifting_diffusion import scale, tolerance, T
 import matplotlib.pyplot as plt
 from jax.experimental.ode import odeint
 from utils import divergence_fn
@@ -9,6 +8,7 @@ from PIL import Image
 import jax
 import seaborn as sns
 from matplotlib import animation
+from typing import List
 
 batch_size_plot = 1000
 
@@ -258,12 +258,12 @@ def plot_velocity_field_2d(args, f_velocity, interval=50):
     # plt.show()
     plt.close(fig)
 
-def plot_density_contour_2d(args, density_data):
+def plot_density_contour_2d(args, density_data: List[jnp.ndarray]):
     fig, ax = plt.subplots(figsize=(6, 6))
     pal = sns.dark_palette("navy", as_cmap=True)
 
     def animate(num):
-        state = density_data[0][num]
+        state = density_data[num]
         x, y = state[:, 0], state[:, 1]
         ax.clear()
         # sns.scatterplot(x=x, y=y, s=5, color=".15")
@@ -272,9 +272,35 @@ def plot_density_contour_2d(args, density_data):
         ax.set_xlim(-args.plot_domain_size, args.plot_domain_size)
         ax.set_ylim(-args.plot_domain_size, args.plot_domain_size)
 
-    anim = animation.FuncAnimation(fig, animate, frames=len(density_data[0]), blit=False)
+    anim = animation.FuncAnimation(fig, animate, frames=len(density_data), blit=False)
     fig.tight_layout()
     file_name = f"{args.plot_save_directory}/{args.PDE}/{args.total_evolving_time}_{args.diffusion_coefficient}_density_contour.gif"
     anim.save(file_name, writer='imagemagick', fps=2)
     # plt.show()
+    plt.close(fig)
+
+def plot_trajectory_2d(args, trajectories: List[jnp.ndarray], plot_multiple=1.1):
+    fig, ax = plt.subplots(figsize=(6, 6))
+    colors = ['red', 'green', 'blue', 'yellow', 'magenta']
+    # plot the trajectory
+    for i, trajectory in enumerate(trajectories):
+        assert trajectory.shape[1] == 2  # the data should be 2D
+        plt.quiver(trajectory[:-1, 0], trajectory[:-1, 1],
+                   trajectory[1:, 0]-trajectory[:-1, 0], trajectory[1:, 1]-trajectory[:-1, 1],
+                   scale_units='xy', angles='xy', scale=1, color=colors[i % len(colors)])
+
+    # mark the start and end points of every trajectory with scatter
+    ## gather the start and end points
+    start_points = jnp.stack([trajectory[0, :] for trajectory in trajectories], axis=0)
+    plt.scatter(start_points[:, 0], start_points[:, 1], marker='o', linewidths=.5, color='b')
+    end_points = jnp.stack([trajectory[-1, :] for trajectory in trajectories], axis=0)
+    plt.scatter(end_points[:, 0], end_points[:, 1], marker='v', linewidths=.5, color='b')
+
+    # particle may leave the domain of plot. increase the x/y limit to include them in the plot
+    ax.set_xlim(-args.plot_domain_size * plot_multiple, args.plot_domain_size * plot_multiple)
+    ax.set_ylim(-args.plot_domain_size * plot_multiple, args.plot_domain_size * plot_multiple)
+
+    fig.tight_layout()
+    file_name = f"{args.plot_save_directory}/{args.PDE}/{args.total_evolving_time}_{args.diffusion_coefficient}_trajecotry.png"
+    plt.savefig(file_name, dpi=600)
     plt.close(fig)

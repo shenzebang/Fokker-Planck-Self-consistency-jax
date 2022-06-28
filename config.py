@@ -9,7 +9,7 @@ def args_parser():
                                                                                 '2D-McKean-Vlasov'])
     parser.add_argument('--model_save_directory', type=str, default='./model')
     parser.add_argument('--diffusion_coefficient', type=float, default=0.)
-    parser.add_argument('--plot_domain_size', type=float, default=1.)
+    parser.add_argument('--plot_domain_size', type=float, default=2.)
     parser.add_argument('--test_domain_size', type=float, default=10.)
     parser.add_argument('--number_of_iterations', type=int, default=5000)
     parser.add_argument('--train_batch_size', type=int, default=1024)
@@ -23,6 +23,9 @@ def args_parser():
     parser.add_argument('--plot_frequency', type=int, default=100)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--dim', type=int, default=2, choices=[2], help='only 2D problems are supported now')
+    parser.add_argument('--load_model', action='store_true', help='load a pretrained model')
+    parser.add_argument('--load_total_evolving_time', type=float, default=2.)
+    parser.add_argument('--save_model', action='store_true', help='save the trained model')
 
 
     args = parser.parse_args()

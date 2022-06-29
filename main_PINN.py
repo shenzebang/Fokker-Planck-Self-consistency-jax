@@ -1,59 +1,41 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import flax.optim
 import jax.numpy as jnp
 from jax.tree_util import tree_flatten, tree_unflatten
 import jax.random as random
 from flax import serialization
-
+import flax.linen as nn
 import jax
 from jax import jvp, grad, value_and_grad, vjp
 from jax.experimental.ode import odeint
 
-from utils import *
 from plot_utils import *
-from model.neural_ode_model_flax import UNet, DenseNet, G2GNet, DenseNet3
+from model.neural_ode_model_flax import DenseNet3
 from core import distribution, potential
-# import torchvision.transforms as transforms
-# from torchvision.utils import make_grid
-# import matplotlib.pyplot as plt
-# from torchvision.datasets import MNIST
-# from sampler import ode_sampler
-# from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 from test_utils import eval_Gaussian_score_and_log_density_FP
 import pandas as pd
-from main_COLT import domain_size, mu_shift, T
-dim = 2
-import functools
-
-
-# global configuration
-
-num_iterations = 5000
-batch_size = 64
-lr = 1e-2
-tolerance = 1e-5
-testing_freq = 100
-save_freq = 1000
-# we use f (net with params) to parameterize log alpha
+from config import args_parser
+import json
 
 
 
-def train_PINN(net, init_distribution: distribution.Distribution, target_potential: potential.Potential, test_data, key):
-    key, subkey = random.split(key)
+def train_PINN(args, net: nn.Module, init_distribution: distribution.Distribution, target_potential: potential.Potential, test_data, key):
+    key1, key2, key3 = random.split(key, 3)
 
     # randomly initialize the model, autobatching is included here
-    params = net.init(subkey, jnp.zeros(1), init_distribution.sample(1))
+    params = net.init(key1, jnp.zeros(1), init_distribution.sample(1, key2))
 
     params_flat, params_tree = tree_flatten(params)
 
     def gv(params, data):
-        f = lambda _x, _t, _params: net.apply(_params, _t, _x)
+        f = lambda _x, _t, _params: net.apply(_params, _t, _x) # f is log \rho
         f_t = grad(f, argnums=1)
         v_f_t = jax.vmap(f_t, in_axes=[0, None, None])
         f_x = grad(f, argnums=0)
-        f_x_grad_V_p_f_x = lambda _x, _t, _params: jnp.dot(f_x(_x, _t, _params), target_potential.gradient(_x) + f_x(_x, _t, _params))
+        f_x_grad_V_p_f_x = lambda _x, _t, _params: jnp.dot(f_x(_x, _t, _params), target_potential.gradient(_x) + args.diffusion_coefficient * f_x(_x, _t, _params))
         v_f_x_grad_V_p_f_x = jax.vmap(f_x_grad_V_p_f_x, in_axes=[0, None, None])
 
         grad_0 = [jnp.zeros_like(_var) for _var in params_flat]
@@ -69,7 +51,7 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
             def loss_t(_params):
                 v1 = v_f_t(data, t, _params)
                 v2 = - v_f_x_grad_V_p_f_x(data, t, _params)
-                v3 = - laplacian_f(_params)
+                v3 = - args.diffusion_coefficient * laplacian_f(_params)
                 v4 = - laplacian_V
                 v = v1 + v2 + v3 + v4
                 return jnp.mean(v ** 2)
@@ -77,14 +59,14 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
 
             return [grad_t(params), loss_t(params)]
 
-        tspace = jnp.array((0., T))
-        result_forward = odeint(ode_func, states_0, tspace, atol=tolerance, rtol=tolerance)
+        tspace = jnp.array((0., args.total_evolving_time))
+        result_forward = odeint(ode_func, states_0, tspace, atol=args.ODE_tolerance, rtol=args.ODE_tolerance)
         # grad_T = result_forward[0][1]
         grad_T = tree_unflatten(params_tree, [_var[1] for _var in result_forward[0]])
         loss_T = result_forward[1][1]
         return grad_T, loss_T
 
-    opt_def = flax.optim.Adam(learning_rate=lr)
+    opt_def = flax.optim.Adam(learning_rate=args.learning_rate)
     opt = opt_def.create(params)
     gv = jax.jit(gv)
 
@@ -111,15 +93,15 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
 
     # unpack the test data
     time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid = test_data
-    for step in trange(num_iterations):
+    for step in trange(args.number_of_iterations):
         key, subkey = random.split(key)
-        data = jax.random.uniform(subkey, (batch_size, dim), minval=-10, maxval=10)
+        data = jax.random.uniform(subkey, (args.train_batch_size, init_distribution.dim), minval=-10, maxval=10)
         # data = init_distribution.sample(batch_size)
         # idx = jax.random.choice(subkey, grid_points.shape[0], (batch_size,))
 
         loss, opt = train_op(opt, data)
         running_avg_loss += loss[0]
-        if step % testing_freq == testing_freq - 1:
+        if step % args.test_frequency == args.test_frequency - 1:
             f_x = grad(net.apply, argnums=2)
             v_f_x = jax.vmap(f_x, in_axes=[None, None, 0])
             vv_f_x = jax.vmap(v_f_x, in_axes=[None, 0, None])
@@ -131,8 +113,8 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
             # log_density_testing_error = jnp.mean((log_density_pred - gaussian_log_density_on_grid) ** 2)
 
             log_density_testing_error = jnp.mean(
-                jnp.sum(jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:])),
-                        axis=1))  # ignore time 0
+                jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:]))
+            )  # ignore time 0
 
             # testing_error = []
             # for i, t in enumerate(time_stamps):
@@ -153,7 +135,7 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
             log_density_testing_error_list.append(log_density_testing_error)
             loss_list.append(running_avg_loss/(step + 1))
 
-        if step % save_freq == save_freq - 1:
+        if step % args.save_frequency == args.save_frequency - 1:
             steps = jnp.array(step_list)
             score_accs = jnp.array(score_testing_error_list)
             log_density_accs = jnp.array(log_density_testing_error_list)
@@ -178,34 +160,45 @@ def train_PINN(net, init_distribution: distribution.Distribution, target_potenti
 
 
 if __name__ == '__main__':
-    key = random.PRNGKey(1)
-    key, subkey = random.split(key)
+    args = args_parser()
 
+    save_directory = f"./{args.plot_save_directory}/{args.PDE}"
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
+    with open(save_directory + '/config.json', 'w') as f:
+        json.dump(vars(args), f)
 
-    mu0 = jnp.zeros((dim,)) - mu_shift
-    # sigma0 = jnp.eye(dim)
+    key = random.PRNGKey(args.seed)
+    key1, key2 = random.split(key)
+
+    ############### initial distribution ###############
+    mu0 = jnp.array([-4.0, -4.0])
     sigma0 = jnp.diag(jnp.array([0.7, 1.3]))
-    init_distribution = distribution.Gaussian(mu0, sigma0, subkey)
+    init_distribution = distribution.Gaussian(mu0, sigma0)
 
-    key, subkey = random.split(key)
-    mu_target = jnp.zeros((dim,)) + mu_shift
-    # sigma_target = jax.random.normal(subkey, (dim, dim))
-    # sigma_target = jnp.eye(dim)
+    ############### drifting term ###############
+    mu_target = jnp.array([4.0, 4.0])
     sigma_target = jnp.diag(jnp.array([1.1, 0.9]))
     target_potential = potential.QuadraticPotential(mu_target, sigma_target)
 
-    # construct the NODE
-    key, subkey = random.split(key)
-    net = DenseNet3(1, subkey)
+    ############### model ###############
+    net = DenseNet3(1, key1) # For PINN, we parameterize the log density
 
+    ############### testing data ###############
     # compute the testing data
-    test_time_stamps = jnp.linspace(0, T, num=11)
-    x, y = jnp.linspace(-domain_size, domain_size, num=201), jnp.linspace(-domain_size, domain_size, num=201)
+    test_time_stamps = jnp.linspace(0, args.total_evolving_time, num=11)
+    x, y = jnp.linspace(-args.test_domain_size, args.test_domain_size, num=201), jnp.linspace(-args.test_domain_size,
+                                                                                              args.test_domain_size,
+                                                                                              num=201)
     xx, yy = jnp.meshgrid(x, y)
     grid_points = jnp.stack([jnp.reshape(xx, (-1)), jnp.reshape(yy, (-1))], axis=1)
     gaussian_scores_on_grid, gaussian_log_density_on_grid \
-        = eval_Gaussian_score_and_log_density_FP(sigma0, mu0, sigma_target, mu_target, test_time_stamps, grid_points, 1)
+        = eval_Gaussian_score_and_log_density_FP(sigma0, mu0, sigma_target, mu_target, test_time_stamps, grid_points,
+                                                 args.diffusion_coefficient)
     test_data = [test_time_stamps, grid_points, gaussian_scores_on_grid, gaussian_log_density_on_grid]
-    params = train_PINN(net, init_distribution, target_potential, test_data, key)
 
-    # plot_result(net, params, init_distribution, target_potential, T)
+    ############### training ###############
+    params = train_PINN(args, net, init_distribution, target_potential, test_data, key2)
+
+    ############### testing & logging ###############
+    # This part is included in the training section

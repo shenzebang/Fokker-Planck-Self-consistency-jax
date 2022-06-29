@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jax.tree_util import tree_flatten, tree_unflatten
 import jax.random as random
 from flax import serialization
+import flax.linen as nn
 
 import jax
 from jax import jvp, grad, value_and_grad, vjp
@@ -24,7 +25,7 @@ from config import args_parser
 from plot_utils import plot_velocity_field_2d, plot_density_contour_2d
 
 
-def train_nwgf(args, net, init_distribution: distribution.Distribution, target_potential: potential.Potential, test_data, key: jnp.ndarray):
+def train_nwgf(args, net: nn.Module, init_distribution: distribution.Distribution, target_potential: potential.Potential, test_data, key: jnp.ndarray):
 
     key1, key2, key3 = jax.random.split(key, 3)
 
@@ -201,7 +202,7 @@ def train_nwgf(args, net, init_distribution: distribution.Distribution, target_p
 
 
         score_error = jnp.mean(jnp.sum((negative_scores_pred + Gaussian_score) ** 2, axis=(2,)))
-        log_density_error = jnp.mean(jnp.sum(jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:])), axis=1))# ignore time 0
+        log_density_error = jnp.mean(jnp.abs(jnp.exp(gaussian_log_density_on_grid[1:]) - jnp.exp(log_density_pred[1:])))# ignore time 0
         return score_error, log_density_error
 
 

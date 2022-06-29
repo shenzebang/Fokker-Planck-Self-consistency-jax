@@ -1,1 +1,0 @@
-python aggregation.py --test_frequency 10 --refer_batch_size 10000 --learning_rate .2e-3 --PDE 2D-Navier-Stokes

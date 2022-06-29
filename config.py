@@ -4,6 +4,7 @@ def args_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--plot_save_directory', type=str, default='./plot')
+    parser.add_argument('--method', type=str, default='NWGF', choices=['NWGF', 'PINN', 'Particle', 'DeepBSDE', 'MLP', 'Galerkin'])
     parser.add_argument('--PDE', type=str, default='2D-Navier-Stokes', choices=['2D-Navier-Stokes',
                                                                                 '2D-Fokker-Planck',
                                                                                 '2D-McKean-Vlasov'])

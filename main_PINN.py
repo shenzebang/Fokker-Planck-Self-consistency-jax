@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import flax.optim
 import jax.numpy as jnp
@@ -30,7 +30,7 @@ def train_PINN(args, net: nn.Module, init_distribution: distribution.Distributio
 
     params_flat, params_tree = tree_flatten(params)
 
-    def gv(params, data):
+    def pinn_gv(params, data):
         f = lambda _x, _t, _params: net.apply(_params, _t, _x) # f is log \rho
         f_t = grad(f, argnums=1)
         v_f_t = jax.vmap(f_t, in_axes=[0, None, None])
@@ -68,12 +68,25 @@ def train_PINN(args, net: nn.Module, init_distribution: distribution.Distributio
 
     opt_def = flax.optim.Adam(learning_rate=args.learning_rate)
     opt = opt_def.create(params)
-    gv = jax.jit(gv)
+    if jax.local_device_count() > 1 and args.use_pmap:
+        gv = jax.pmap(pinn_gv, in_axes=(None, 0))
+    else:
+        gv = jax.jit(pinn_gv)
 
     # define train_op
     def train_op(_opt, x):
+        if jax.local_device_count() > 1 and args.use_pmap:
+            # split the input
+            x = jnp.stack(jnp.split(x, jax.local_device_count()), axis=0)
 
-        g, v = gv(_opt.target, x)
+            # compute in parallel
+            g, v = gv(_opt.target, x)
+
+            # average the gradient
+            g = jax.tree_map(lambda _g : jnp.mean(_g, axis=0), g)
+            v = jnp.mean(v, axis=0)
+        else:
+            g, v = gv(_opt.target, x)
 
         return v, _opt.apply_gradient(g)
 

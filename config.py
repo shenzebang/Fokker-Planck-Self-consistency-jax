@@ -27,6 +27,7 @@ def args_parser():
     parser.add_argument('--load_model', action='store_true', help='load a pretrained model')
     parser.add_argument('--load_total_evolving_time', type=float, default=2.)
     parser.add_argument('--save_model', action='store_true', help='save the trained model')
+    parser.add_argument('--use_pmap', action='store_true', help='use pmap to accelerate gradient computation')
 
 
     args = parser.parse_args()
